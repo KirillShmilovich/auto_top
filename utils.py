@@ -1,6 +1,7 @@
 import numpy as np
 import mdtraj as md
 import networkx as nx
+from itertools import combinations_with_replacement
 
 code_from_letter = {
     "A": "Ala",
@@ -130,3 +131,161 @@ def parse_pdb(pdb_fname, base_fname=None, residue=False):
     # distance_dict = {edge: dis for edge, dis in zip(G.edges, edge_distances)}
     # nx.set_edge_attributes(G, distance_dict, "distance")
     return G
+
+
+def rotation_matrix(alpha, beta, gamma):
+    """ Returns rotation matrix for transofmorming N x 3 coords (A @ R)"""
+    Rx = np.array(
+        [
+            [1, 0, 0],
+            [0, np.cos(alpha), -np.sin(alpha)],
+            [0, np.sin(alpha), np.cos(alpha)],
+        ]
+    )
+    Ry = np.array(
+        [[np.cos(beta), 0, np.sin(beta)], [0, 1, 0], [-np.sin(beta), 0, np.cos(beta)]]
+    )
+    Rz = np.array(
+        [
+            [np.cos(gamma), -np.sin(gamma), 0],
+            [np.sin(gamma), np.cos(gamma), 0],
+            [0, 0, 1],
+        ]
+    )
+    R = Rz @ Ry @ Rx
+    Rt = R.T
+    return Rt
+
+
+def rotation_matrix_batch(alpha, beta, gamma):
+    """ Returns rotation matrix for transofmorming N x 3 coords (A @ R)"""
+    n = len(alpha)
+
+    def ef(x):
+        a = np.empty(n)
+        a.fill(x)
+        return a
+
+    Rx = np.array(
+        [
+            [ef(1), ef(0), ef(0)],
+            [ef(0), np.cos(alpha), -np.sin(alpha)],
+            [ef(0), np.sin(alpha), np.cos(alpha)],
+        ]
+    )
+    Ry = np.array(
+        [
+            [np.cos(beta), ef(0), np.sin(beta)],
+            [ef(0), ef(1), ef(0)],
+            [-np.sin(beta), ef(0), np.cos(beta)],
+        ]
+    )
+    Rz = np.array(
+        [
+            [np.cos(gamma), -np.sin(gamma), ef(0)],
+            [np.sin(gamma), np.cos(gamma), ef(0)],
+            [ef(0), ef(0), ef(1)],
+        ]
+    )
+    # 'li' not 'il' b/c transpose
+    Rt = np.einsum("ij...,jk...,kl...->li...", Rz, Ry, Rx)
+    return Rt
+
+
+def get_template_position(template_trj, template_G, name):
+    compare_dict = nx.get_node_attributes(template_G, "compare")
+    atom_idx = [a.index for a, v in compare_dict.items() if v == name]
+
+    if len(atom_idx) != 1:
+        raise ValueError(f"Number of selected atoms {len(atom_idx)} (should be 1)")
+
+    atom_idx = atom_idx[0]
+    pos = template_trj.xyz[0, atom_idx]
+    return pos
+
+
+def get_SC(AA_trj, AA_G):
+    """Isolate sidechain trj from AA_trj, given the graph (AA_G) """
+    compare_dict = nx.get_node_attributes(AA_G, "compare")
+    SC_idx = [k.index for k, v in compare_dict.items() if v == "S"]
+    SC = AA_trj.atom_slice(SC_idx)
+    return SC
+
+
+def shift_SC(SC_trj, SC_G, rotation, anchor):
+    pass
+
+
+def remove_anchors(template_trj, template_G):
+    pass
+
+
+def get_SC_G(SC_trj, AA_trj, AA_G):
+    compare_dict = nx.get_node_attributes(AA_G, "compare")
+    for (a0, a1) in AA_G.edges:
+        if compare_dict[a0] == "A":
+            if compare_dict[a1] == "S":
+                anchor = a1
+                break
+        if compare_dict[a1] == "A":
+            if compare_dict[a0] == "S":
+                anchor = a0
+                break
+    SC_G = make_bondgraph(SC_trj.top)
+    anchor_dict = dict()
+    for atom in SC_trj.top.atoms:
+        if atom.name == anchor.name:
+            anchor_dict[atom] = True
+        else:
+            anchor_dict[atom] = False
+
+    nx.set_node_attributes(SC_G, anchor_dict, "anchor")
+    return SC_G
+
+
+def get_SC_rotation(AA_trj, AA_G, target_ev, n=50):
+    """ AA_trj is the amino acid trj; AA_G is the amino acid Graph, and target_ev is the target direction"""
+    SC = get_SC(AA_trj, AA_G)
+    SC.center_coordinates()
+    B = SC.xyz[0]
+
+    # Get rotation matricies
+    theta = np.linspace(0, np.pi, 50)
+    theta = np.array(list(combinations_with_replacement(theta, 3)))
+    Rs = rotation_matrix_batch(theta[:, 0], theta[:, 1], theta[:, 2])
+
+    # Generate rotation
+    Bs = np.einsum("ij,jk...->ik...", B, Rs)
+    SC.xyz = Bs.transpose(2, 0, 1)
+
+    # Compute gyration tensor
+    T = md.compute_gyration_tensor(SC)
+
+    # Spectral decomposition
+    ls, evs = np.linalg.eig(T)
+    largest_ev = np.array([ev[:, i] for ev, i in zip(evs, np.argmax(ls, axis=1))])
+    best_idx = np.linalg.norm((largest_ev - target_ev), axis=1).argmin()
+
+    # Find the best rotation matrix
+    best_R = Rs[:, :, best_idx]
+    return best_R
+
+
+def get_SC_direction(template_trj, template_G, name):
+    """template_trj is template trj; template_G is template graph; and name is the name of the AA (e.g. L1)"""
+    compare_dict = nx.get_node_attributes(template_G, "compare")
+    C_idx = [k.index for k, v in compare_dict.items() if v == f"C{name}"]
+    H_idx = [k.index for k, v in compare_dict.items() if v == f"H{name}"]
+
+    if (len(C_idx) != 1) or (len(H_idx) != 1):
+        raise ValueError(f"Cannot find atoms for name {name}")
+
+    C_idx = C_idx[0]
+    H_idx = H_idx[0]
+
+    C_xyz = template_trj.xyz[0, C_idx]
+    H_xyz = template_trj.xyz[0, H_idx]
+
+    d = H_xyz - C_xyz
+    d_norm = d / np.linalg.norm(d)
+    return d_norm
